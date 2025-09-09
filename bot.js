@@ -5,63 +5,35 @@ const qrcode = require('qrcode-terminal');
 const fs = require('fs');
 const FormData = require('form-data');
 const express = require('express');
+const config = require('./config'); // Importa as configurações
 
-// === CONFIGURAÇÕES ===
-const GLPI_API_URL = "http://10.81.0.7/glpi/apirest.php";
-const GLPI_APP_TOKEN = "LsIQLEi8MmqhWN8oaRlptbCt4LVCKr5Kw25KBeOI";
-const GLPI_USER_TOKEN = "lL5g9e1XyN979JtQ5wQUeso6RgiI9dWE7mXTO9Wb";
-const INACTIVITY_MINUTES = 5;
-const USER_EMAILS_PATH = './user_emails.json';
-const WEBHOOK_PORT = 3000;
-const DEBUG_MODE = false; // Mude para true para ver logs detalhados
-const TITLE_MAX_CHARS = 20;
-const DESCRIPTION_MIN_CHARS = 25;
-
-// Nova constante para desduplicação de webhooks
-const BOT_INITIATED_UPDATE_COOLDOWN_MS = 30 * 1000; // 30 segundos de cooldown
-// Atraso para processar webhooks (garante que a mensagem do bot chegue primeiro)
-const WEBHOOK_PROCESSING_DELAY_MS = 7 * 1000; // 7 segundos de atraso
+// Desestrutura as constantes do arquivo de configuração para fácil acesso
+const {
+    GLPI_API_URL,
+    GLPI_APP_TOKEN,
+    GLPI_USER_TOKEN,
+    INACTIVITY_MINUTES,
+    USER_EMAILS_PATH,
+    WEBHOOK_PORT,
+    DEBUG_MODE,
+    TITLE_MAX_CHARS,
+    DESCRIPTION_MIN_CHARS,
+    KNOWLEDGE_BASE_URL,
+    BOT_INITIATED_UPDATE_COOLDOWN_MS,
+    WEBHOOK_PROCESSING_DELAY_MS,
+    CATEGORIES_DISPLAY,
+    CATEGORIES_API_MAP,
+    GLPI_STATUS_MAP
+} = config;
 
 let userStates = {};
 let userEmails = {};
 
-// Map para armazenar os timers de processamento de webhook por usuário
+// Mapas para controle de webhooks
 const pendingWebhookTimers = new Map();
-// Map para armazenar o conteúdo do último webhook recebido por usuário
 const userPendingWebhookContent = new Map();
-// Map para controlar a supressão de webhooks por ação do bot
 const botActionSuppressions = new Map();
 
-const CATEGORIES_DISPLAY = {
-    '1': '🖥️ GW sistemas',
-    '2': '📧 E-mail',
-    '3': '🌐 Rede interna e internet',
-    '4': '💳 Pamcard',
-    '5': '💻 Hardware',
-    '6': '📱 Celulares',
-    '7': '❓ Dúvida',
-    '8': '📦 Disponibilização de equipamento',
-    '9': '💡 Outros'
-};
-const CATEGORIES_API_MAP = {
-    '🖥️ GW sistemas': 35,
-    '📧 E-mail': 9,
-    '🌐 Rede interna e internet': 42,
-    '💳 Pamcard': 78,
-    '💻 Hardware': 15,
-    '📱 Celulares': 80,
-    '❓ Dúvida': 8,
-    '📦 Disponibilização de equipamento': 3,
-    '💡 Outros': 85
-};
-const GLPI_STATUS_MAP = {
-    1: 'Novo',
-    2: 'Em atendimento (atribuído)',
-    3: 'Em atendimento (planejado)',
-    4: 'Pendente',
-    5: 'Solucionado',
-    6: 'Fechado'
-};
 
 // --- FUNÇÕES AUXILIARES ---
 function getExtensionFromMime(mimeType) {
@@ -78,6 +50,7 @@ function loadUserEmails() {
     try {
         if (fs.existsSync(USER_EMAILS_PATH)) {
             let fileContent = fs.readFileSync(USER_EMAILS_PATH, 'utf8');
+            // Limpa vírgulas extras que podem quebrar o JSON.parse
             const cleanedContent = fileContent.replace(/,\s*([}\]])/g, '$1');
             userEmails = JSON.parse(cleanedContent);
             console.log('✅ Emails dos usuários carregados.');
@@ -101,15 +74,16 @@ async function saveUserEmails() {
 function stripHtmlTags(htmlContent) {
     if (!htmlContent) return '';
     let content = htmlContent.toString();
+    // Decodifica entidades HTML comuns
     content = content.replace(/&amp;/g, '&')
-                      .replace(/&lt;/g, '<')
-                      .replace(/&gt;/g, '>')
-                      .replace(/&quot;/g, '\"')
-                      .replace(/&#39;/g, '\'')
-                      .replace(/&#60;/g, '<')
-                      .replace(/&#62;/g, '>')
-                      .replace(/&nbsp;/g, ' ');
+        .replace(/&lt;/g, '<')
+        .replace(/&gt;/g, '>')
+        .replace(/&quot;/g, '\"')
+        .replace(/&#39;/g, '\'')
+        .replace(/&nbsp;/g, ' ');
+    // Remove todas as tags HTML
     content = content.replace(/<[^>]*>?/gm, '');
+    // Consolida múltiplas quebras de linha
     content = content.replace(/(\r\n|\n|\r){2,}/g, '\n');
     return content.trim();
 }
@@ -128,13 +102,13 @@ async function startBot() {
     sock.ev.on('connection.update', (update) => {
         const { connection, lastDisconnect, qr } = update;
         if (qr) {
-            console.log("📱 Escaneie o QR Code:");
+            console.log("📱 Escaneie o QR Code para conectar:");
             qrcode.generate(qr, { small: true });
         }
         if (connection === 'open') console.log('✅ Bot WhatsApp conectado!');
         if (connection === 'close') {
             const shouldReconnect = (lastDisconnect.error?.output?.statusCode !== DisconnectReason.loggedOut);
-            console.log(`❌ Conexão fechada. Reconectando: ${shouldReconnect}`);
+            console.log(`❌ Conexão fechada. Tentando reconectar: ${shouldReconnect}`);
             if (shouldReconnect) startBot();
         }
     });
@@ -144,7 +118,7 @@ async function startBot() {
         if (userStates[from]) {
             userStates[from].timeoutId = setTimeout(async () => {
                 if (userStates[from]) {
-                    if (DEBUG_MODE) console.log(`DEBUG: Sessão para ${from} expirou.`);
+                    if (DEBUG_MODE) console.log(`DEBUG: Sessão para ${from} expirou por inatividade.`);
                     if (userStates[from].sessionToken) await closeSession(userStates[from].sessionToken);
                     await sock.sendMessage(from, { text: `Sua sessão foi encerrada por *inatividade*. Para começar de novo, envie qualquer mensagem. 👋` });
                     delete userStates[from];
@@ -203,9 +177,7 @@ async function startBot() {
             case 'awaiting_email':
                 await handleEmailInput(from, normalizedText);
                 break;
-            case 'awaiting_ip':
-                await handleIpInput(from, text);
-                break;
+            // Opcional: Removido 'awaiting_ip' para ser mais genérico, pode ser reativado se necessário
             case 'awaiting_attachment_option':
                 await handleAttachmentOption(from, normalizedText, msg);
                 break;
@@ -220,9 +192,6 @@ async function startBot() {
                 break;
             case 'awaiting_ticket_to_cancel':
                 await handleTicketCancellationSelection(from, normalizedText);
-                break;
-            case 'awaiting_attachment_decision':
-                await handleAttachmentDecision(from, normalizedText);
                 break;
             case 'awaiting_followup_decision':
                 await handleFollowupDecision(from, normalizedText);
@@ -248,6 +217,7 @@ async function startBot() {
         }
         
         try {
+            // Nota: Estas Regex podem precisar de ajustes dependendo do template de notificação do seu GLPI
             const regexTitulo = /Título\s*:\s*([^\n]+)/;
             const matchTicketId = rawBody.match(/Chamado[:\s#]+(\d+)/);
             const regexEmailRequerente = /(?:<b>)?\s*(?:📧)?\s*E-mail:\s*(?:<\/b>)?\s*([^<\s]+)/;
@@ -272,7 +242,7 @@ async function startBot() {
                     suppression.ticketId === webhookTicketId &&
                     (Date.now() - suppression.timestamp < BOT_INITIATED_UPDATE_COOLDOWN_MS)) {
                     
-                    if (DEBUG_MODE) console.log(`DEBUG: Webhook para ${userJidForWebhook} (ticket #${webhookTicketId}) ignorado (ação do bot).`);
+                    if (DEBUG_MODE) console.log(`DEBUG: Webhook para ${userJidForWebhook} (ticket #${webhookTicketId}) ignorado (ação recente do bot).`);
                     return;
                 }
                 
@@ -343,7 +313,7 @@ async function startBot() {
     
     // --- FUNÇÕES DE FLUXO DE CONVERSA ---
     async function showMainMenu(from, senderName) {
-        await sock.sendMessage(from, { text: `Olá ${senderName}! 👋 Eu sou o bot de suporte do GLPI.\n\nComo posso ajudar?\n\n*1.* 🎫 Abrir um chamado\n*2.* 📚 Site de procedimentos TIC\n*3.* 🔎 Consuar/Responder um chamado\n*4.* ❌ Cancelar um chamado\n\n_(Digite *'0'* a qualquer momento para sair)_` });
+        await sock.sendMessage(from, { text: `Olá ${senderName}! 👋 Sou um bot de suporte integrado ao GLPI.\n\nComo posso ajudar?\n\n*1.* 🎫 Abrir um chamado\n*2.* 📚 Base de Conhecimento\n*3.* 🔎 Consultar/Responder um chamado\n*4.* ❌ Encerrar um chamado\n\n_(Digite *'0'* a qualquer momento para sair)_` });
         userStates[from] = { state: 'menu' };
         resetInactivityTimer(from);
     }
@@ -355,27 +325,28 @@ async function startBot() {
             for (const key in CATEGORIES_DISPLAY) categoryMessage += `*${key}.* ${CATEGORIES_DISPLAY[key]}\n`;
             categoryMessage += `\n_(Digite *'0'* para sair)_`;
             await sock.sendMessage(from, { text: categoryMessage });
-            resetInactivityTimer(from);
         } else if (normalizedText === '2') {
-            await sock.sendMessage(from, { text: "Aqui está o link para o nosso site de procedimentos de TIC:\nhttps://focuslog.sharepoint.com/sites/Procedimentos-TIC\n\nConsulta finalizada. Se precisar de algo mais, é só chamar! 👋" });
+            await sock.sendMessage(from, { text: `Aqui está o link para nossa Base de Conhecimento:\n${KNOWLEDGE_BASE_URL}\n\nConsulta finalizada. Se precisar de algo mais, é só chamar! 👋` });
             delete userStates[from];
         } else if (normalizedText === '3' || normalizedText === '4') {
             const nextFlow = normalizedText === '3' ? 'awaiting_ticket_selection' : 'awaiting_ticket_to_cancel';
-            const actionText = normalizedText === '3' ? 'consultar' : 'cancelar';
+            const actionText = normalizedText === '3' ? 'consultar' : 'encerrar';
             const storedEmail = userEmails[from];
             if (storedEmail) {
                 await listUserOpenTickets(from, storedEmail, nextFlow, actionText);
             } else {
-                userStates[from].state = 'awaiting_email_for_flow';
-                userStates[from].nextFlow = nextFlow;
-                userStates[from].actionText = actionText;
+                userStates[from] = {
+                    ...userStates[from],
+                    state: 'awaiting_email_for_flow',
+                    nextFlow: nextFlow,
+                    actionText: actionText
+                };
                 await sock.sendMessage(from, { text: `Para ${actionText} seus chamados, por favor, informe seu *email* de cadastro no GLPI.` });
-                resetInactivityTimer(from);
             }
         } else {
             await sock.sendMessage(from, { text: 'Opção inválida. Por favor, digite *1*, *2*, *3* ou *4*.' });
-            resetInactivityTimer(from);
         }
+        resetInactivityTimer(from);
     }
 
     async function handleCategorySelection(from, normalizedText) {
@@ -430,8 +401,10 @@ async function startBot() {
     async function handleEmailConfirmation(from, normalizedText) {
         if (normalizedText === '1') {
             userStates[from].email = userEmails[from];
-            userStates[from].state = 'awaiting_ip';
-            await sock.sendMessage(from, { text: `Ok. Agora, informe o *IP da sua máquina*.\n\n💡 *Dica:* Posicione o mouse sobre o ícone azul do UltraVNC (👁️) perto do relógio.\n\n_(Digite *'0'* para sair)_` });
+            // Pulando a etapa de IP para o fluxo de anexo
+            userStates[from].state = 'awaiting_attachment_option';
+            userStates[from].attachments = [];
+            await sock.sendMessage(from, { text: `Deseja adicionar um anexo (*imagem* ou *documento*)?\n\n*1.* Sim\n*2.* Não\n\n_(Pode enviar o arquivo diretamente)_\n\n_(Digite *'0'* para sair)_` });
         } else if (normalizedText === '2') {
             userStates[from].state = 'awaiting_email';
             await sock.sendMessage(from, { text: `Ok. Por favor, digite o seu *email* correto.\n\n_(Digite *'0'* para sair)_` });
@@ -442,22 +415,22 @@ async function startBot() {
     }
 
     async function handleEmailInput(from, normalizedText) {
+        // Validação simples de e-mail
+        if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(normalizedText)) {
+            await sock.sendMessage(from, { text: "❌ E-mail inválido. Por favor, digite um endereço de e-mail válido." });
+            resetInactivityTimer(from);
+            return;
+        }
         userStates[from].email = normalizedText;
         userEmails[from] = normalizedText;
         await saveUserEmails();
-        userStates[from].state = 'awaiting_ip';
-        await sock.sendMessage(from, { text: `Ok, email salvo! Agora, informe o *IP da sua máquina*.\n\n💡 *Dica:* Posicione o mouse sobre o ícone azul do UltraVNC (👁️) perto do relógio.\n\n_(Digite *'0'* para sair)_` });
-        resetInactivityTimer(from);
-    }
-
-    async function handleIpInput(from, text) {
-        userStates[from].ip = text;
-        userStates[from].attachments = [];
+        // Pulando a etapa de IP para o fluxo de anexo
         userStates[from].state = 'awaiting_attachment_option';
-        await sock.sendMessage(from, { text: `Deseja adicionar um anexo (*imagem* ou *documento*)?\n\n*1.* Sim\n*2.* Não\n\n_(Pode enviar o arquivo diretamente)_\n\n_(Digite *'0'* para sair)_` });
+        userStates[from].attachments = [];
+        await sock.sendMessage(from, { text: `Ok, email salvo! Deseja adicionar um anexo (*imagem* ou *documento*)?\n\n*1.* Sim\n*2.* Não\n\n_(Pode enviar o arquivo diretamente)_\n\n_(Digite *'0'* para sair)_` });
         resetInactivityTimer(from);
     }
-
+    
     async function handleAttachmentOption(from, normalizedText, msg) {
         const contentType = getContentType(msg.message);
         if (contentType === 'imageMessage' || contentType === 'documentMessage') {
@@ -475,17 +448,18 @@ async function startBot() {
             userStates[from].senderName = msg.pushName || 'Usuário';
             await showTicketSummaryAndConfirm(from, userStates[from]);
         } else {
-             await sock.sendMessage(from, { text: `Opção inválida ou anexo não detectado. Por favor, envie o anexo ou digite *1* para adicionar ou *2* para finalizar.` });
+            await sock.sendMessage(from, { text: `Opção inválida ou anexo não detectado. Por favor, envie o anexo ou digite *1* para adicionar ou *2* para finalizar.` });
         }
         resetInactivityTimer(from);
     }
 
     async function showTicketSummaryAndConfirm(from, ticketData) {
-        const { category, title, description } = ticketData;
+        const { category, title, description, attachments } = ticketData;
         let summary = "📝 *Resumo do Chamado*\n\n";
         summary += `*Categoria:* ${category}\n`;
         summary += `*Título:* ${title}\n`;
-        summary += `*Descrição:* ${description}\n\n`;
+        summary += `*Descrição:* ${description}\n`;
+        summary += `*Anexos:* ${attachments.length}\n\n`;
         summary += "Você confirma as informações e deseja criar o chamado?\n\n*1.* Sim\n*2.* Não, cancelar tudo\n\n_(Digite *'0'* para sair)_";
         userStates[from].state = 'awaiting_creation_confirmation';
         await sock.sendMessage(from, { text: summary });
@@ -506,13 +480,18 @@ async function startBot() {
     }
 
     async function handleEmailForFlow(from, normalizedText) {
+        if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(normalizedText)) {
+            await sock.sendMessage(from, { text: "❌ E-mail inválido. Por favor, digite um endereço de e-mail válido." });
+            resetInactivityTimer(from);
+            return;
+        }
         userEmails[from] = normalizedText;
         await saveUserEmails();
         const { nextFlow, actionText } = userStates[from];
         await listUserOpenTickets(from, normalizedText, nextFlow, actionText);
     }
 
-    // --- Funções de Consulta e Resposta a Chamados ---
+    // --- Funções de Consulta, Resposta e Cancelamento ---
     async function handleTicketSelection(from, normalizedText) {
         const choice = parseInt(normalizedText, 10);
         const { foundTickets } = userStates[from];
@@ -524,13 +503,13 @@ async function startBot() {
         }
 
         const selectedTicket = foundTickets[choice - 1];
-        userStates[from].selectedTicketId = selectedTicket.id; // Salva o ID do ticket para uso posterior
+        userStates[from].selectedTicketId = selectedTicket.id;
         userStates[from].selectedTicketTitle = selectedTicket.title;
         await sock.sendMessage(from, { text: `Buscando detalhes do chamado *#${selectedTicket.id}*... ⏳` });
 
-        let sessionToken = null;
+        let sessionToken = userStates[from].sessionToken; // Reutiliza o token
         try {
-            sessionToken = await initSession();
+            if (!sessionToken) sessionToken = await initSession();
             userStates[from].sessionToken = sessionToken;
 
             const ticketDetails = await axios.get(`${GLPI_API_URL}/Ticket/${selectedTicket.id}`, {
@@ -543,29 +522,29 @@ async function startBot() {
             const status = GLPI_STATUS_MAP[ticketDetails.data.status] || 'Desconhecido';
 
             let response = `📋 *Detalhes do Chamado*\n` +
-                          `🆔 *Chamado:* #${selectedTicket.id}\n` +
-                          `📝 *Título:* ${selectedTicket.title}\n` +
-                          `📌 *Status:* ${status}\n` +
-                          `📅 *Aberto em:* ${new Date(ticketDetails.data.date_creation).toLocaleString('pt-BR')}\n` +
-                          `🔄 *Última atualização:* ${new Date(ticketDetails.data.date_mod).toLocaleString('pt-BR')}\n`;
+                         `🆔 *Chamado:* #${selectedTicket.id}\n` +
+                         `📝 *Título:* ${selectedTicket.title}\n` +
+                         `📌 *Status:* ${status}\n` +
+                         `📅 *Aberto em:* ${new Date(ticketDetails.data.date_creation).toLocaleString('pt-BR')}\n` +
+                         `🔄 *Última atualização:* ${new Date(ticketDetails.data.date_mod).toLocaleString('pt-BR')}\n`;
 
             let historyText = "\n💬 *Histórico de Atualizações:*\n\n";
 
             // Adiciona a descrição inicial
-            const mainContentExtraction = cleanAndExtractImages(ticketDetails.data.content);
-            if (mainContentExtraction.cleanedText) {
-                const creationDate = new Date(ticketDetails.data.date_creation).toLocaleString('pt-BR', { day: '2-digit', month: '2-digit', year: 'numeric', hour: '2-digit', minute: '2-digit' }).replace(',', ' -');
-                historyText += `*${creationDate}:*\n${mainContentExtraction.cleanedText}\n\n`;
+            if (ticketDetails.data.content) {
+                const mainContentText = stripHtmlTags(ticketDetails.data.content);
+                const creationDate = new Date(ticketDetails.data.date_creation).toLocaleString('pt-BR', { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' }).replace(',', ' às');
+                historyText += `*${creationDate} (Abertura):*\n${mainContentText}\n\n`;
             }
 
             // Adiciona os acompanhamentos
             if (followups.data?.length > 0) {
                 const sortedFollowups = followups.data.sort((a, b) => new Date(a.date) - new Date(b.date));
                 sortedFollowups.forEach(f => {
-                    const followupExtraction = cleanAndExtractImages(f.content);
-                    if (followupExtraction.cleanedText) {
-                        const followupDate = new Date(f.date).toLocaleString('pt-BR', { day: '2-digit', month: '2-digit', year: 'numeric', hour: '2-digit', minute: '2-digit' }).replace(',', ' -');
-                        historyText += `*${followupDate}:*\n${followupExtraction.cleanedText}\n\n`;
+                    const followupText = stripHtmlTags(f.content);
+                    if (followupText) {
+                        const followupDate = new Date(f.date).toLocaleString('pt-BR', { day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' }).replace(',', ' às');
+                        historyText += `*${followupDate}:*\n${followupText}\n\n`;
                     }
                 });
             }
@@ -573,7 +552,6 @@ async function startBot() {
             response += historyText;
             await sock.sendMessage(from, { text: response });
 
-            // Pergunta se deseja adicionar uma resposta
             userStates[from].state = 'awaiting_followup_decision';
             await sock.sendMessage(from, { text: `Deseja adicionar uma resposta a este chamado?\n\n*1.* Sim\n*2.* Não\n\n_(Digite *'0'* para sair)_` });
             resetInactivityTimer(from);
@@ -642,16 +620,18 @@ async function startBot() {
         }
 
         const selectedTicket = foundTickets[choice - 1];
-        await sock.sendMessage(from, { text: `❌ Fechando o chamado *#${selectedTicket.id}*...` });
+        await sock.sendMessage(from, { text: `❌ Encerrando o chamado *#${selectedTicket.id}*...` });
 
-        let sessionToken = null;
+        let sessionToken = userStates[from].sessionToken;
         try {
-            sessionToken = await initSession();
+            if (!sessionToken) sessionToken = await initSession();
+            
             const statusPayload = { input: { status: 6 } }; // Status 6 = Fechado
             await axios.put(`${GLPI_API_URL}/Ticket/${selectedTicket.id}`, statusPayload, {
                 headers: { 'Session-Token': sessionToken, 'App-Token': GLPI_APP_TOKEN }
             });
 
+            // Adiciona supressão de webhook para evitar eco da notificação de fechamento
             botActionSuppressions.set(from, {
                 ticketId: selectedTicket.id,
                 timestamp: Date.now()
@@ -663,25 +643,17 @@ async function startBot() {
                 }
             }, BOT_INITIATED_UPDATE_COOLDOWN_MS);
 
-            await sock.sendMessage(from, { text: `✅ Chamado *#${selectedTicket.id}* fechado com sucesso!` });
+            await sock.sendMessage(from, { text: `✅ Chamado *#${selectedTicket.id}* encerrado com sucesso!` });
             
         } catch (error) {
             console.error("❌ Erro ao fechar o chamado:", error.response?.data || error.message);
-            await sock.sendMessage(from, { text: `⚠️ Ocorreu um erro ao tentar fechar o chamado.` });
+            await sock.sendMessage(from, { text: `⚠️ Ocorreu um erro ao tentar encerrar o chamado.` });
         } finally {
             if (sessionToken) await closeSession(sessionToken);
             delete userStates[from];
         }
     }
 
-    async function handleAttachmentDecision(from, normalizedText) {
-        // Esta função não é mais chamada diretamente, pois a lógica de anexos agora é interna
-        // à consulta (através da extração de base64). Mantida por segurança.
-        await sock.sendMessage(from, { text: "Consulta finalizada. Se precisar de algo mais, é só chamar! 👋" });
-        if (userStates[from]?.sessionToken) await closeSession(userStates[from].sessionToken);
-        delete userStates[from];
-    }
-    
     // --- FUNÇÕES DE INTERAÇÃO COM API GLPI ---
     async function initSession() {
         try {
@@ -690,8 +662,8 @@ async function startBot() {
             });
             return session.data.session_token;
         } catch (error) {
-            console.error("❌ Erro ao iniciar sessão GLPI:", error.message);
-            throw new Error("Não foi possível iniciar uma sessão com o GLPI.");
+            console.error("❌ Erro ao iniciar sessão GLPI:", error.response?.data?.message || error.message);
+            throw new Error("Não foi possível iniciar uma sessão com o GLPI. Verifique URL e Tokens.");
         }
     }
 
@@ -708,11 +680,11 @@ async function startBot() {
     }
     
     async function listUserOpenTickets(from, email, nextState, actionText) {
-        await sock.sendMessage(from, { text: `🔎 Buscando chamados de *${email}*...` });
+        await sock.sendMessage(from, { text: `🔎 Buscando chamados abertos para *${email}*...` });
         let sessionToken = null;
         try {
             sessionToken = await initSession();
-            userStates[from].sessionToken = sessionToken; // Salva o token para uso futuro
+            userStates[from].sessionToken = sessionToken; // Salva para reuso
 
             const userSearch = await axios.get(`${GLPI_API_URL}/search/User`, {
                 headers: { 'Session-Token': sessionToken, 'App-Token': GLPI_APP_TOKEN },
@@ -734,12 +706,13 @@ async function startBot() {
                 headers: { 'Session-Token': sessionToken, 'App-Token': GLPI_APP_TOKEN },
                 params: {
                     'criteria[0][field]': '4', 'criteria[0][searchtype]': 'equals', 'criteria[0][value]': glpiUserId,
+                    'criteria[1][link]': 'AND',
+                    'criteria[1][field]': '12', 'criteria[1][searchtype]': 'less', 'criteria[1][value]': '5', // Status < 5 (Solucionado)
                     'forcedisplay[0]': '2', 'forcedisplay[1]': '1', 'forcedisplay[2]': '12', 'range': '0-50'
                 }
             });
 
-            const tickets = ticketsResp.data.data || [];
-            const openTickets = tickets.filter(t => t['12'] < 5); // Status < 5 (Solucionado)
+            const openTickets = ticketsResp.data.data || [];
 
             if (openTickets.length === 0) {
                 await sock.sendMessage(from, { text: `Você não possui chamados em aberto no momento.` });
@@ -760,7 +733,8 @@ async function startBot() {
             userStates[from].state = nextState;
             await sock.sendMessage(from, { text: ticketListMessage });
             resetInactivityTimer(from);
-            // Não fecha a sessão aqui, ela será usada na próxima etapa
+            // Não fecha a sessão aqui, pois será usada na próxima etapa
+
         } catch (error) {
             console.error("❌ Erro ao listar chamados:", error.response?.data || error.message);
             await sock.sendMessage(from, { text: '⚠️ Ocorreu um erro ao buscar seus chamados. Tente novamente mais tarde.' });
@@ -769,27 +743,18 @@ async function startBot() {
         }
     }
     
-    function cleanAndExtractImages(htmlContent) {
-        if (!htmlContent) return { cleanedText: '', images: [] };
-        // Função para limpar HTML e extrair imagens base64. (Mantida como no seu código original)
-        let content = htmlContent;
-        content = content.replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '\"').replace(/&#39;/g, '\'').replace(/&#60;/g, '<').replace(/&#62;/g, '>').replace(/&nbsp;/g, ' ');
-        content = content.replace(/<br\s*\/?>/gi, '\n').replace(/<\/p>/gi, '\n').replace(/<p[^>]*>/gi, '');
-        content = content.replace(/<[^>]*>?/gm, '');
-        return { cleanedText: content.trim().replace(/\n\s*\n/g, '\n'), images: [] };
-    }
-
     async function handleTicketCreation(from, senderName, ticketData) {
+        await sock.sendMessage(from, { text: `Criando seu chamado, um momento... ⏳` });
         let sessionToken = null;
         try {
             sessionToken = await initSession();
             const { glpiUserId, glpiUserName } = await getGlpiUser(sessionToken, ticketData.email, from);
             const ticketId = await createGlpiTicket(sessionToken, ticketData, glpiUserId, glpiUserName, senderName, from);
             await processAttachments(sessionToken, ticketId, ticketData);
-            await sock.sendMessage(from, { text: `✅ Chamado *#${ticketId}* aberto com sucesso!\n\nVocê pode me mandar uma nova mensagem para iniciar um novo chamado.` });
+            await sock.sendMessage(from, { text: `✅ Chamado *#${ticketId}* aberto com sucesso!\n\nSe precisar de algo mais, é só me chamar.` });
         } catch (error) {
             console.error("❌ Erro na criação do chamado:", error.response?.data || error.message);
-            await sock.sendMessage(from, { text: '⚠️ Ocorreu um erro ao abrir seu chamado.' });
+            await sock.sendMessage(from, { text: '⚠️ Ocorreu um erro ao abrir seu chamado. Por favor, tente novamente.' });
         } finally {
             if (sessionToken) await closeSession(sessionToken);
             delete userStates[from];
@@ -808,9 +773,10 @@ async function startBot() {
             });
             if (data?.totalcount > 0) {
                 const userData = data.data[0];
-                return { glpiUserId: userData['2'], glpiUserName: `${userData['9'] || ''} ${userData['34'] || ''}`.trim() || 'Nome não cadastrado' };
+                const fullName = `${userData['9'] || ''} ${userData['34'] || ''}`.trim() || 'Nome não cadastrado';
+                return { glpiUserId: userData['2'], glpiUserName: fullName };
             } else {
-                await sock.sendMessage(from, { text: `⚠️ *Atenção:* Não encontrei um usuário no GLPI com o email *'${email}'*. O chamado será aberto, mas não associado ao seu cadastro.` });
+                await sock.sendMessage(from, { text: `⚠️ *Atenção:* Não encontrei um usuário no GLPI com o email *'${email}'*. O chamado será aberto, mas não ficará associado ao seu cadastro.` });
                 return { glpiUserId: null, glpiUserName: 'Não encontrado' };
             }
         } catch (error) {
@@ -820,28 +786,28 @@ async function startBot() {
     }
 
     async function createGlpiTicket(sessionToken, ticketData, glpiUserId, glpiUserName, senderName, from) {
-        const { title, category, description, email, attachments, ip } = ticketData;
+        const { title, category, description, email, attachments } = ticketData;
 
-        let ticketContent = `<p><b>👤 Nome (GLPI):</b> ${glpiUserName}</p>` +
+        let ticketContent = `<p><b>ℹ️ Informações do Solicitante:</b></p>`+
+                            `<p><b>👤 Nome (GLPI):</b> ${glpiUserName}</p>` +
                             `<p><b>📧 E-mail:</b> ${email || 'N/A'}</p>` +
-                            `<p><b>💻 IP da máquina:</b> ${ip || 'N/A'}</p>` +
                             `<p><b>📞 Número (WhatsApp):</b> ${from.split('@')[0]}</p><hr>` +
-                            `<p><b>📝 Descrição:</b></p><p>${description.replace(/\n/g, '<br>')}</p>`;
+                            `<p><b>📝 Descrição do Problema:</b></p><p>${description.replace(/\n/g, '<br>')}</p>`;
 
         const imagesContent = attachments
             .filter(att => att.mimeType.startsWith('image/'))
-            .map(att => `<p><img src=\"data:${att.mimeType};base64,${att.base64Content}\" /></p>`)
+            .map(att => `<p><img src=\"data:${att.mimeType};base64,${att.base64Content}\" alt="Anexo de imagem" /></p>`)
             .join('');
 
         if (imagesContent) {
-            ticketContent += `<hr><p><b>🖼️ Imagens Anexas:</b></p>${imagesContent}`;
+            ticketContent += `<hr><p><b>🖼️ Imagens Anexadas:</b></p>${imagesContent}`;
         }
 
         const ticketInput = {
-            name: `${title} - ${senderName} via WhatsApp`,
+            name: `${title} (via WhatsApp por ${senderName})`,
             content: ticketContent,
-            requesttypes_id: 1,
-            urgency: 3,
+            requesttypes_id: 1, // Origem da Requisição: Helpdesk (padrão)
+            urgency: 3, // Urgência: Média (padrão)
             itilcategories_id: CATEGORIES_API_MAP[category] || 0
         };
 
@@ -861,8 +827,9 @@ async function startBot() {
 
         for (const [index, attachment] of attachments.entries()) {
             const { mimeType, base64Content } = attachment;
-            if (!mimeType.startsWith('image/')) { // Apenas anexa documentos que não são imagens
-                const fileExtension = getExtensionFromMime(mimeType);
+            // Apenas anexa documentos que NÃO são imagens, pois imagens já foram embutidas no corpo
+            if (!mimeType.startsWith('image/')) {
+                const fileExtension = getExtensionFromMime(mimeType) || '.dat';
                 const fileName = `anexo_${ticketId}_${index + 1}${fileExtension}`;
 
                 const formData = new FormData();
@@ -896,16 +863,15 @@ async function startBot() {
         }
         
         try {
-            // REVERTIDO: Remove o nome do usuário do conteúdo do acompanhamento
             let followupContent = `<p>${followupText.replace(/\n/g, '<br>')}</p>`;
 
             const imagesContent = attachments
                 .filter(att => att.mimeType.startsWith('image/'))
-                .map(att => `<p><img src=\"data:${att.mimeType};base64,${att.base64Content}\" /></p>`)
+                .map(att => `<p><img src=\"data:${att.mimeType};base64,${att.base64Content}\" alt="Anexo de imagem" /></p>`)
                 .join('');
     
             if (imagesContent) {
-                followupContent += `<hr><p><b>🖼️ Imagens Anexas:</b></p>${imagesContent}`;
+                followupContent += `<hr><p><b>🖼️ Imagens Anexadas:</b></p>${imagesContent}`;
             }
 
             const followupPayload = {
@@ -913,14 +879,14 @@ async function startBot() {
                     items_id: selectedTicketId,
                     itemtype: 'Ticket',
                     content: followupContent,
-                    is_private: 0
+                    is_private: 0 // Acompanhamento público
                 }
             };
             await axios.post(`${GLPI_API_URL}/TicketFollowup`, followupPayload, {
                 headers: { 'Session-Token': sessionToken, 'App-Token': GLPI_APP_TOKEN }
             });
 
-            // Envia documentos que não são imagens
+            // Envia documentos (não-imagens) como anexo separado
             await processAttachments(sessionToken, selectedTicketId, { attachments, title: `Resposta ao chamado ${selectedTicketId}` });
 
             await sock.sendMessage(from, { text: `✅ Sua resposta foi adicionada ao chamado *#${selectedTicketId}* com sucesso!` });
@@ -935,5 +901,3 @@ async function startBot() {
 }
 
 startBot();
-
-
